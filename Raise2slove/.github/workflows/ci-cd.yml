@@ -1,0 +1,118 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_FRONTEND_REPO: raise2solve/frontend
+  ECR_BACKEND_REPO: raise2solve/backend
+  ROLE_TO_ASSUME: arn:aws:iam::123456789012:role/raise2solve-github-actions-oidc-role
+
+jobs:
+  test:
+    name: Lint, Test, and Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-level: '20'
+
+      - name: Install Frontend Dependencies
+        working-directory: ./
+        run: |
+          npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+
+      - name: Build Frontend
+        working-directory: ./
+        run: npm run build --if-present
+
+      - name: Install Backend Dependencies
+        working-directory: ./backend
+        run: |
+          npm ci || npm install
+
+      - name: Run Backend Tests
+        working-directory: ./backend
+        run: npm test --if-present
+
+  security-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Frontend Test Image
+        run: |
+          docker build -t raise2solve/frontend:test .
+
+      - name: Build Backend Test Image
+        run: |
+          docker build -t raise2solve/backend:test ./backend
+
+      - name: Scan Frontend Image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'raise2solve/frontend:test'
+          scan-type: 'image'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0' # Set to 1 in strict security pipelines to block builds
+
+      - name: Scan Backend Image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'raise2solve/backend:test'
+          scan-type: 'image'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0'
+
+  publish:
+    name: Build & Publish to AWS ECR
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Frontend Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: git-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ECR_FRONTEND_REPO }}:$IMAGE_TAG -t $ECR_REGISTRY/${{ env.ECR_FRONTEND_REPO }}:latest .
+          docker push $ECR_REGISTRY/${{ env.ECR_FRONTEND_REPO }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_FRONTEND_REPO }}:latest
+
+      - name: Build, Tag, and Push Backend Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: git-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.ECR_BACKEND_REPO }}:$IMAGE_TAG -t $ECR_REGISTRY/${{ env.ECR_BACKEND_REPO }}:latest ./backend
+          docker push $ECR_REGISTRY/${{ env.ECR_BACKEND_REPO }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_BACKEND_REPO }}:latest
